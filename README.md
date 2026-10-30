@@ -3,6 +3,13 @@
 Agent-native **buyer** CLI for Shopee Taiwan (`shopee.tw`, TWD). Zero dependencies (Python 3.8+ stdlib).
 Search, product, price checks, login, and a read-only cart view. **No checkout, no cart writes.**
 
+> [!WARNING]
+> **Shopee rate-limits hard: budget a few dozen requests per account per day, not hundreds.**
+> Measured 2026-10-30: `429 Too Many Requests` after ~20 requests in ~10 min, and after ~40 requests in
+> ~45 min Shopee refused even its own search page. The CLI paces requests (≥ 9 s, shared across processes),
+> caches result pages for 10 min, and on a block exits 4 with a cool-down instead of retrying.
+> Run one `shopee` command at a time, and don't work around the pacing. Details: [Rate limits](#rate-limits-built-in-please-dont-work-around-them).
+
 ```bash
 shopee doctor
 shopee search 衛生紙 [--sort relevance|price|price-desc|sales|newest] [--page 2] [--limit 20] [--min 100 --max 500]

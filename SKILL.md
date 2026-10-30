@@ -1,6 +1,6 @@
 ---
 name: shopee
-description: Use when searching Shopee Taiwan (shopee.tw) as a buyer, comparing TWD prices across listings and variants, checking a product's variants/stock/seller, or viewing (read-only) the user's Shopee cart.
+description: Use when searching Shopee Taiwan (shopee.tw) as a buyer, comparing TWD prices across listings and variants, checking a product's variants/stock/seller, or viewing (read-only) the user's Shopee cart. Shopee rate-limits hard (a few dozen requests per account per day): one command at a time, never loop or retry on exit 4.
 ---
 
 # shopee: Shopee Taiwan buyer CLI (no checkout)
@@ -9,7 +9,7 @@ description: Use when searching Shopee Taiwan (shopee.tw) as a buyer, comparing 
 tab of the user's signed-in Edge on CDP 9222 (`SHOPEE_CDP`), because Shopee signs its API calls in the page
 and refuses plain HTTPS (`90309999`). Start with `shopee doctor` (it costs at most one request).
 
-## Rate limits: read first
+## ⚠ Rate limits: read first (exceeding them blocks the user's account, which is also their seller shop)
 - Shopee answered `429 Too Many Requests` after ~12 page loads in ~10 min, and after ~40 requests in ~45
   min it refused even its own search page (`90309999`) (measured 2026-10-30). The account is also the
   user's seller shop, so keep usage to a few dozen requests and batch what you need. Run ONE `shopee` command at a time, never in parallel.
