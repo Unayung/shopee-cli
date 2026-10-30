@@ -117,7 +117,11 @@ Rate limits and pacing (built in)
   * Multi-request commands (price with several ids, uncached price-sorted
     pools) print the number of requests and expected wait to stderr first.
 
-Login: never passwords/OTP. `shopee login` copies shopee.tw cookies (not
+Login: never passwords/OTP. `shopee login` takes a DevTools `Cookie:` request
+header of a signed-in shopee.tw request: from stdin when piped, else from the
+clipboard (exit 2 + instructions if the clipboard holds no signed-in Shopee
+Cookie header). Also --from-clipboard / --cookie-stdin.
+`shopee login --from-browser` (opt-in) copies shopee.tw cookies (not
 seller.shopee.tw) from Edge on SHOPEE_CDP; if Edge is signed out it opens
 https://shopee.tw/buyer/login in a background tab and waits (--wait 300) for
 you. Saved to ~/.config/shopee/state.json (0600) or keyring; SHOPEE_COOKIE
@@ -1347,15 +1351,29 @@ def _clipboard():
     raise Auth("clipboard is empty or no clipboard tool (wl-paste / pbpaste / xclip)")
 
 
+LOGIN_HOWTO = ("no signed-in shopee.tw Cookie header found. In the browser: DevTools > Network > click any "
+               "request to shopee.tw > Request Headers > copy the `Cookie:` value, "
+               "then run `shopee login` again (or pipe it in)")
+
+
 def cmd_login(args):
     _set_cdp(args.cdp)
-    if args.from_clipboard or args.cookie_stdin:
-        raw = _clipboard() if args.from_clipboard else sys.stdin.read()
+    default = not (args.from_clipboard or args.cookie_stdin or args.from_browser)
+    if default:
+        try:
+            raw = _clipboard() if sys.stdin.isatty() else sys.stdin.read()
+        except Auth:
+            raw = ""
+        if not _signed_in(header_to_cookies(clean_cookie(raw))):
+            raise Usage(LOGIN_HOWTO)
+    if default or args.from_clipboard or args.cookie_stdin:
+        if not default:
+            raw = _clipboard() if args.from_clipboard else sys.stdin.read()
         cookies = header_to_cookies(clean_cookie(raw))
         if not _signed_in(cookies):
             raise Auth("that Cookie header has no signed-in SPC_U; copy it from a logged-in shopee.tw request")
         ua = os.environ.get("SHOPEE_UA") or DEFAULT_UA
-        src = "clipboard" if args.from_clipboard else "stdin"
+        src = "clipboard" if args.from_clipboard or (default and sys.stdin.isatty()) else "stdin"
     else:
         cookies, ua = edge_cookies()
         if not _signed_in(cookies):
@@ -1694,9 +1712,9 @@ def build_parser():
     pc.add_argument("refs", nargs="+")
     pc.set_defaults(fn=cmd_price)
 
-    lg = sub.add_parser("login", parents=[common], help="save a signed-in shopee.tw session (never passwords)")
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in shopee.tw session (default: Cookie header from stdin or clipboard)")
     g = lg.add_mutually_exclusive_group()
-    g.add_argument("--from-browser", action="store_true", help="(default) copy the session from Edge on CDP")
+    g.add_argument("--from-browser", action="store_true", help="(opt-in) copy the session from Edge on CDP")
     g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
     g.add_argument("--cookie-stdin", action="store_true", help="Cookie header on stdin")
     lg.add_argument("--wait", type=int, default=300, help="seconds to wait for you to sign in in Edge")

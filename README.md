@@ -86,20 +86,34 @@ Shopee API prices are integers = TWD × 100000. Listings often have variants wit
 
 ## Login (no password, ever)
 
+Shopee signs in with a password (+ OTP), so the CLI never takes credentials. It logs in with the `Cookie`
+request header of a browser session you already have:
+
+1. In your browser: DevTools > Network > click any request to `shopee.tw` > Request Headers.
+2. Copy the value of `Cookie:` (with or without the leading `Cookie: `). It must be from a signed-in
+   session (`SPC_U` is a number, not `-`).
+3. Run `shopee login`. It reads the clipboard, or stdin when piped.
+
 ```bash
-shopee login                    # = --from-browser: copy the shopee.tw session from Edge on CDP;
-                                #   if Edge is not signed in, opens the sign-in page in a background
-                                #   tab and waits (--wait 300) while you sign in there yourself
-shopee login --from-clipboard   # DevTools "Cookie" request header
-shopee login --cookie-stdin
+shopee login                    # Cookie header from stdin (piped) or the clipboard;
+                                #   nothing usable there = exit 2 with these steps
+shopee login --from-clipboard   # clipboard only
+shopee login --cookie-stdin     # stdin only
 shopee login --keyring          # store cookies in the OS keyring (secret-tool / macOS security)
+shopee login --from-browser     # opt-in: copy the shopee.tw session from Edge on CDP 9222; if Edge is
+                                #   not signed in, opens the sign-in page in a background tab (--wait 300)
 shopee whoami                   # verifies the SAVED session over plain HTTPS
 shopee logout                   # deletes only the CLI's saved session; Edge stays signed in
 ```
 
 Session: `~/.config/shopee/state.json` (0600, moved by `SHOPEE_HOME`) or keyring; `SHOPEE_COOKIE` overrides.
-Only `shopee.tw` cookies are copied (seller.shopee.tw is ignored). Because the signed transport runs in
-Edge, `cart list` refuses to run when Edge is signed in as a different user than the saved session.
+Before saving, the header is checked with `get_account_info` over plain HTTPS. Exit 3 means there is no valid
+session (or it expired): log in again. Only `shopee.tw` cookies are used (seller.shopee.tw is ignored). Because
+the signed transport runs in Edge, `cart list` refuses to run when Edge is signed in as a different user than
+the saved session.
+
+**Edge on CDP 9222 is needed for search, product (and price) and cart**, which run inside a background tab;
+`login` (without `--from-browser`) and `whoami` use plain HTTPS only.
 
 ## Cart (購物車): read-only
 

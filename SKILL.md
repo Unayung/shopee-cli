@@ -38,10 +38,13 @@ and refuses plain HTTPS (`90309999`). Start with `shopee doctor` (it costs at mo
   within that pool, not across the whole catalogue. Ads, duplicates and NT$99,999 gift placeholders are
   dropped. NT$1-3 single-pack listings are real but bait; check the per-unit value and shipping.
 
-## Login (never ask for or type passwords/OTP)
-- `shopee login` copies shopee.tw cookies from Edge (if Edge is signed out it opens the sign-in page in a
-  background tab and waits for the user). `shopee whoami` verifies the SAVED session over plain HTTPS
-  (username, userid). `shopee logout` deletes only the CLI's copy. Exit 3 = run `shopee login`.
+## Login (never ask for or type passwords/OTP; never ask the user to paste cookies into chat)
+- Tell the user: DevTools > Network > click any shopee.tw request (signed in) > copy the `Cookie:` request
+  header to the clipboard, then run `shopee login` themselves (or pipe it in on stdin). No usable Cookie
+  header = exit 2 with those steps. `--from-browser` is opt-in only (Edge on CDP 9222; if Edge is signed out
+  it opens the sign-in page in a background tab and waits for the user). `shopee whoami` verifies the SAVED
+  session over plain HTTPS (username, userid). `shopee logout` deletes only the CLI's copy. Exit 3 = run
+  `shopee login`. Login and whoami do not need Edge; search, product, price and cart do.
 
 ## Cart (read-only)
 - `shopee cart list --json` lists every line (line, id, modelid, quantity). Name/spec/price/checked come
