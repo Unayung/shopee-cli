@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*.tmp
+state.json
+.last_request
+search_sessions.json

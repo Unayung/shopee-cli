@@ -1,0 +1,1754 @@
+#!/usr/bin/env python3
+"""
+shopee - agent-native BUYER CLI for Shopee Taiwan (shopee.tw, TWD). No checkout.
+Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+returns the {ok, data|error} envelope used by the other ~/Projects shop CLIs.
+Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked (incl. Shopee anti-bot).
+
+Transport, measured 2026-10-30 against the user's real Edge on CDP 9222
+------------------------------------------------------------------------
+  * Plain HTTPS to /api/v4/search/search_items (browser UA, Referer) ->
+    HTTP 403 {"error":90309999,...,"9":true}: Shopee's anti-bot code for an
+    unsigned request. The web app's own calls carry af-ac-enc-dat,
+    af-ac-enc-sz-token, x-sap-ri, x-sap-sec, x-sz-sdk-version, d-nonptcha-sync
+    (all minted in-page by the anti-fraud SDK).
+  * fetch() from inside a shopee.tw tab -> same 90309999 (the SDK does not
+    hook fetch).
+  * XMLHttpRequest from inside a shopee.tw tab -> the SDK DOES hook XHR and
+    adds the signed headers itself; measured 200 with data, but only about 1
+    in 3 attempts (others 90309999), even 8 s after page load, and 0/3 for
+    cart/add_to_cart. Used only by `raw` (and whoami --via browser).
+  * Loading the real page in a background tab and reading the page's OWN API
+    response (CDP Network.getResponseBody) -> 200 with data on ~20 loads in a
+    row. This is the read transport: search page -> /api/v4/search/search_items,
+    product page -> /api/v4/pdp/get_pc, cart page -> /api/v4/cart/get. Later
+    (after ~40 requests in ~45 min, 9-25 s apart) even the search page's own
+    search_items came back as the 1.2 kB 90309999 refusal (5 loads, 12:18-12:33),
+    while the cart page still loaded - so 90309999 means "stop for a while"
+    no matter which transport.
+  * Rate: an HTML "429 Too Many Requests" page came back after ~12 page loads
+    + ~8 XHRs in ~10 minutes. The CLI paces requests (SHOPEE_MIN_INTERVAL,
+    default 9 s, shared across processes) and caches each Shopee result page
+    for 10 minutes (SHOPEE_CACHE_TTL) so paging/sorting re-uses data.
+  * Guests (signed out): search page=N is rewritten to page=0, and product
+    pages redirect to /verify/traffic/error?...is_logged_in=false&type=4 with
+    get_pc -> 90309999. A captcha (/verify/captcha?scene=crawler_item) was
+    shown once after ~9 guest page loads/XHRs. Everything here assumes Edge is
+    signed in on shopee.tw; the CLI never solves captchas or types passwords.
+
+Endpoints (the page's own requests unless noted)
+------------------------------------------------
+Search  GET /api/v4/search/search_items?by=<relevancy|price|sales|ctime>
+            &keyword=<q>&limit=60&newest=<page*60>&order=<asc|desc>
+            &page_type=search&scenario=PAGE_GLOBAL_SEARCH&source=SRP&version=2
+        issued by https://shopee.tw/search?keyword=<q>[&sortBy=price&order=asc][&page=N]
+        (signed in: page=N honoured -> newest=N*60, 60 items). Two item
+        shapes were seen: item_basic{price,price_min,price_max,
+        price_min_before_discount,...} (XHR) and item_data{item_card_display_price
+        {price,strikethrough_price,applied_product_promo_price,original_price,
+        recommended_shop_voucher_info}} + item_card_displayed_asset{name,...}
+        (the page's own request). Measured 60/60 items:
+        applied_product_promo_price == item_basic.price_min.
+        Prices are integers = TWD x 100000.
+        Ads: search_item_tracking JSON has is_ads / item_type_str ("organic");
+        adsid/campaignid set on ad slots. 32 of 60 raw results on a signed-in
+        relevance page were ads (dropped).
+        PRICE BASIS: `price` = the lowest variant's current price (price_min,
+        after product promotions, before vouchers). The search card's own
+        number (`card_price`) can be lower because Shopee subtracts a
+        recommended shop voucher (measured: NT$3 item shown as NT$0 after a
+        NT$3 voucher with min spend 0); it is reported but never sorted on.
+        Shopee's own price sort orders by that card number, so for
+        --sort price/price-desc the CLI pools Shopee's first
+        PRICE_POOL_PAGES x 60 price-sorted results, drops ads/hidden prices,
+        dedupes by (shopid,itemid) and re-sorts by `price` - so the order is
+        monotonic, but only within that pool (ceiling documented).
+        Relevance: Shopee reorders its own page 0 between calls (measured:
+        page-1/page-2 overlap 1/10 without caching), hence the result-page
+        cache plus a per-query memory of ids already shown on earlier pages.
+        Placeholders: listings priced exactly NT$99,999 are dropped - both seen
+        were gift-only ("<贈品專用，請勿自行下單！>", "加價購 [完全贈品]").
+        NT$1-3 listings are real (checked: 【活動用】 NT$1 = one single pack,
+        orig NT$10, shipping NT$45-165) and are kept.
+Product GET /api/v4/pdp/get_pc?item_id=&shop_id=&tz_offset_in_minutes=480&detail_level=0
+        issued by https://shopee.tw/product/<shopid>/<itemid>. data.item: title,
+        brand, price_min/price_max (+ _before_discount), raw_discount, stock
+        (null; stock_display "尚有庫存"), tier_variations[{name,options}],
+        models[{model_id,name,price,price_before_discount,has_stock,
+        extinfo.tier_index}]; data.product_price.price.single_value = the
+        voucher-applied 券後價 when has_final_price (measured 995 -> 915, shop
+        voucher YFYSN1080 NT$80 off >= NT$800); data.shop_detailed{name,
+        is_official_shop}; data.product_shipping.ungrouped_channel_infos[].name
+        and shipping_fee_info.price; data.product_review{rating_star,
+        total_rating_count}. Search price_min == product price_min (995 == 995).
+Account GET /api/v4/account/basic/get_account_info -> data{userid, username,
+        nickname, email, phone, shopid}. Works over PLAIN HTTPS with the saved
+        cookies (measured), so login/whoami need no browser.
+Cart    POST /api/v4/cart/get  body {"pre_selected_item_list":[],
+        "updated_time_filter":{"start_time":0},"cart_state":{},
+        "version_list":[3787143115,1023]} (issued by https://shopee.tw/cart).
+        data.cart_block_id_list[].item_briefs = EVERY line (shopid, itemid,
+        modelid, quantity; measured 47) but data.cart_blocks[].items details
+        (name, model_name, price, stock, status, checkout) only for the first
+        pagination_info.item_limit = 20. The page loads the rest on scroll via
+        an observer that does not fire in a hidden tab (8 scrolls: nothing).
+        POST /api/v4/cart/add_to_cart {quantity, checkout:false,
+        update_checkout_only:false, donot_add_quantity:false, source:"",
+        shopid, itemid, modelid}  and  POST /api/v4/cart/update
+        {action_type: 1 EDIT_QUANTITY | 2 DELETE, updated_shop_order_ids:[{shopid,
+        item_briefs:[{shopid,itemid,modelid,item_group_id,add_on_deal_id,
+        is_add_on_sub_item,quantity,old_modelid,old_quantity,checkout,
+        applied_promotion_id,price}]}], selected_shop_order_ids, promotion_data,
+        cart_state, version_list} - shapes taken from the public cart/PDP JS
+        bundles on deo.shopeemobile.com, NOT from a captured live write.
+        MEASURED 2026-10-30: add_to_cart via the signed in-page XHR was refused
+        3/3 times (90309999); the re-read cart was unchanged each time. Driving
+        the real buttons was declined (account risk: it is also a seller shop),
+        so `cart add/qty/rm` refuse up front with exit 2 and make no request.
+        update (qty/rm) was never attempted live.
+
+Rate limits and pacing (built in)
+---------------------------------
+  * >= SHOPEE_MIN_INTERVAL seconds (default 9) between Shopee requests across
+    all `shopee` processes (timestamp ~/.config/shopee/.last_request).
+  * Any 429 / 90309999 / captcha / traffic-verify -> exit 4, no retry, and a
+    cool-down (~/.config/shopee/.cooldown_until: 10 min, 3 min for 90309999)
+    that makes every later call refuse to send anything until it expires.
+  * Multi-request commands (price with several ids, uncached price-sorted
+    pools) print the number of requests and expected wait to stderr first.
+
+Login: never passwords/OTP. `shopee login` copies shopee.tw cookies (not
+seller.shopee.tw) from Edge on SHOPEE_CDP; if Edge is signed out it opens
+https://shopee.tw/buyer/login in a background tab and waits (--wait 300) for
+you. Saved to ~/.config/shopee/state.json (0600) or keyring; SHOPEE_COOKIE
+overrides. SPC_U = numeric user id when signed in, "-" when signed out
+(SPC_EC is "-" even when signed in - not a logout signal).
+
+No checkout / order / payment endpoint is ever called (cart/checkout exists in
+the bundle and is deliberately not used).
+
+Unofficial, undocumented private API; it can break without warning. Shopee
+bans automation aggressively; this account may also be a seller shop.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import select
+import socket
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+CDP = os.environ.get("SHOPEE_CDP", "http://127.0.0.1:9222")
+ORIGIN = "https://shopee.tw"
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0")
+STATE_DIR = os.path.expanduser(os.environ.get("SHOPEE_HOME", "~/.config/shopee"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+SEARCH_FILE = os.path.join(STATE_DIR, "search_sessions.json")
+COOLDOWN_FILE = os.path.join(STATE_DIR, ".cooldown_until")
+# measured 2026-10-30: HTML 429 after ~12 page loads + ~8 XHRs in ~10 minutes; a
+# 10-minute pause cleared it. 90309999 refusals were not rate-only, but back off too.
+COOLDOWN_SECONDS = int(os.environ.get("SHOPEE_COOLDOWN", "600"))
+MIN_INTERVAL_DEFAULT = 9.0
+KEYRING_SERVICE = "shopee-cli"
+KR_CHUNK = 4000
+PRICE_SCALE = 100000  # Shopee API prices are integer TWD * 100000
+
+
+class Net(Exception):
+    pass
+
+
+class Blocked(Net):
+    """Shopee refused us (HTML 429, anti-bot 90309999, captcha, traffic-verify).
+    Never retried automatically: records a cool-down that every later CLI call
+    honours, and tells the user how long to wait."""
+
+    def __init__(self, msg, wait=None):
+        wait = int(wait or COOLDOWN_SECONDS)
+        super().__init__(f"{msg}. Stopped; wait about {max(1, round(wait / 60))} min before the next "
+                         f"Shopee request (cool-down recorded in {COOLDOWN_FILE})")
+        self.wait = wait
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            until = time.time() + wait
+            try:
+                with open(COOLDOWN_FILE, encoding="utf-8") as f:
+                    until = max(until, float(f.read().strip() or 0))
+            except (OSError, ValueError):
+                pass
+            with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
+                f.write(str(until))
+        except OSError:
+            pass
+
+
+class Auth(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, msg, detail=None):
+        super().__init__(msg)
+        self.detail = detail
+
+
+class Usage(ApiError):
+    pass
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code, "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human() if callable(human) else
+              (human if human is not None else
+               json.dumps(payload["data"], ensure_ascii=False, indent=2)))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+def _w(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w("" if c is None else c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))  # noqa: E731
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(pad("" if c is None else c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def clip(text, n):
+    text = (text or "").replace("\n", " ").strip()
+    if _w(text) <= n:
+        return text
+    out = ""
+    for c in text:
+        if _w(out + c) > n - 1:
+            break
+        out += c
+    return out + "…"
+
+
+def nt(v):
+    if v is None:
+        return ""
+    return f"NT${v:,.0f}" if float(v).is_integer() else f"NT${v:,.2f}"
+
+
+def twd(raw):
+    """Shopee integer price (TWD*100000) -> TWD number (int when whole)."""
+    if raw is None or raw < 0:
+        return None
+    v = raw / PRICE_SCALE
+    return int(v) if float(v).is_integer() else round(v, 2)
+
+
+# -------------------------------------------------------- CDP (stdlib ws)
+class WS:
+    def __init__(self, url, timeout=60):
+        if not url.startswith("ws://"):
+            raise Net(f"unsupported websocket url {url}")
+        hostport, path = url[5:].split("/", 1)
+        host, port = hostport.rsplit(":", 1)
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=timeout)
+            self.timeout = timeout
+        except OSError as e:
+            raise Net(f"cannot reach browser at {hostport}: {e}")
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise Net("websocket handshake closed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise Net("websocket handshake refused (start Edge with --remote-allow-origins='*')")
+        self.rest = buf.split(b"\r\n\r\n", 1)[1]
+        self.n = 0
+        self.events = []
+
+    def _recv(self, n):
+        while len(self.rest) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise Net("browser closed the connection")
+            self.rest += chunk
+        out, self.rest = self.rest[:n], self.rest[n:]
+        return out
+
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        hdr += mask
+        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_msg(self):
+        msg = b""
+        while True:
+            b0, b1 = self._recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv(8))[0]
+            payload = self._recv(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise Net("browser closed the websocket")
+            if op in (9, 10):
+                continue
+            msg += payload
+            if b0 & 0x80:
+                return json.loads(msg)
+
+    def call(self, method, **params):
+        self.n += 1
+        i = self.n
+        self._send({"id": i, "method": method, "params": params})
+        while True:
+            m = self._recv_msg()
+            if "method" in m:
+                self.events.append(m)
+                del self.events[:-2000]
+                continue
+            if m.get("id") == i:
+                if "error" in m:
+                    raise Net(f"{method}: {m['error'].get('message')}")
+                return m["result"]
+
+    def pump(self, seconds):
+        """Collect CDP notifications for up to `seconds` (whole frames only)."""
+        end = time.time() + seconds
+        while time.time() < end:
+            if not self.rest:
+                ready, _, _ = select.select([self.s], [], [], max(0.0, end - time.time()))
+                if not ready:
+                    break
+            m = self._recv_msg()
+            if "method" in m:
+                self.events.append(m)
+                del self.events[:-2000]
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _http_json(path):
+    try:
+        with urllib.request.urlopen(CDP + path, timeout=5) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        raise Net(f"no browser on {CDP} ({e}). Start Edge with --remote-debugging-port=9222; "
+                  "this CLI never launches a browser itself")
+
+
+def _set_cdp(cdp):
+    global CDP
+    if cdp:
+        CDP = cdp
+
+
+def edge_cookies():
+    """All shopee.tw cookies from the CDP browser (browser-level, no tab needed).
+    seller.shopee.tw cookies are excluded; this CLI is buyer-side only."""
+    ver = _http_json("/json/version")
+    b = WS(ver["webSocketDebuggerUrl"])
+    try:
+        cks = b.call("Storage.getCookies")["cookies"]
+    finally:
+        b.close()
+    keep = [{"name": c["name"], "value": c["value"], "domain": c["domain"], "path": c.get("path", "/")}
+            for c in cks if c.get("domain", "").lstrip(".") in ("shopee.tw", "www.shopee.tw")]
+    return keep, ver.get("User-Agent")
+
+
+def is_challenge_url(u):
+    u = u or ""
+    return "/verify/" in u or "/buyer/login" in u and "next=" in u or "captcha" in u.lower()
+
+
+class Browser:
+    """One background tab on shopee.tw, closed on exit. Never focused, never
+    navigates or closes any tab it did not create."""
+
+    def __init__(self, debug=False, url=ORIGIN + "/", wait=True):
+        self.debug = debug
+        self._url = url
+        self._net = False
+        self.ver = _http_json("/json/version")
+        self.b = WS(self.ver["webSocketDebuggerUrl"])
+        self.tid = self.b.call("Target.createTarget", url=url, background=True)["targetId"]
+        try:
+            tgt = next(x for x in _http_json("/json/list") if x["id"] == self.tid)
+            self.p = WS(tgt["webSocketDebuggerUrl"], timeout=90)
+            if wait:
+                self._wait_ready()
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+    def _wait_ready(self, limit=40):
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            r = self.eval("location.href + '|' + document.readyState")
+            if r and r.startswith("https://shopee.tw") and not r.endswith("|loading"):
+                if is_challenge_url(r):
+                    raise Blocked("Shopee showed a verification/login page in the background tab: "
+                                  + r.split("|")[0][:160] + " (not solved by this CLI)")
+                return
+            time.sleep(0.7)
+        raise Net("shopee.tw did not load in the background tab")
+
+    def eval(self, expr):
+        r = self.p.call("Runtime.evaluate", expression=expr, awaitPromise=True, returnByValue=True)
+        if r.get("exceptionDetails"):
+            raise ApiError("page script failed: " + str(
+                r["exceptionDetails"].get("exception", {}).get("description")
+                or r["exceptionDetails"].get("text")))
+        return r.get("result", {}).get("value")
+
+    def navigate(self, url, wait_ready=True):
+        self.p.call("Page.navigate", url=url)
+        if wait_ready:
+            time.sleep(0.5)
+            self._wait_ready()
+
+    def fetch(self, method, url, body=None, headers=None):
+        opts = {"method": method, "credentials": "include", "headers": headers or {}}
+        if body is not None:
+            if isinstance(body, (dict, list)):
+                opts["body"] = json.dumps(body)
+                opts["headers"].setdefault("Content-Type", "application/json")
+            else:
+                opts["body"] = str(body)
+        js = ("fetch(%s,%s).then(async r=>({http:r.status,text:await r.text()}))"
+              % (json.dumps(url), json.dumps(opts)))
+        r = self.eval(js)
+        if self.debug:
+            print(f"[tab] {method} {url} -> {r['http']} {r['text'][:200]}", file=sys.stderr)
+        return r["http"], r["text"]
+
+    def xhr(self, method, url, body=None, headers=None):
+        """XMLHttpRequest from inside the shopee.tw page. Measured 2026-10-30:
+        Shopee's anti-bot SDK hooks XHR (not fetch) and adds af-ac-enc-dat /
+        af-ac-enc-sz-token / x-sap-ri / x-sap-sec / x-sz-sdk-version itself, so
+        an in-page XHR is signed like the app's own calls; a plain in-page fetch()
+        gets {"error":90309999} instead."""
+        hdrs = dict(headers or {})
+        data = None
+        if body is not None:
+            data = body if isinstance(body, str) else json.dumps(body)
+            hdrs.setdefault("Content-Type", "application/json")
+        js = ("new Promise(res=>{const x=new XMLHttpRequest();x.open(%s,%s,true);"
+              "x.withCredentials=true;const h=%s;for(const k in h)x.setRequestHeader(k,h[k]);"
+              "x.onload=()=>res({http:x.status,text:x.responseText});"
+              "x.onerror=()=>res({http:0,text:'network error'});"
+              "x.ontimeout=()=>res({http:0,text:'timeout'});x.timeout=30000;x.send(%s);})"
+              % (json.dumps(method), json.dumps(url), json.dumps(hdrs), json.dumps(data)))
+        r = self.eval(js)
+        if self.debug:
+            print(f"[tab xhr] {method} {url} {(data or '')[:200]} -> {r['http']} {r['text'][:200]}",
+                  file=sys.stderr)
+        return r["http"], r["text"]
+
+    def capture(self, url, patterns, timeout=30, settle=1.5, action_js=None):
+        """Navigate this (background) tab to a real shopee.tw page and return the
+        bodies of the page's OWN API responses whose URL contains any of
+        `patterns` -> {pattern: (status, url, body_text|None)}. The page's JS
+        signs those requests itself (af-ac-enc-dat / x-sap-sec); we only read
+        them. body None = Chrome kept no body: measured 2026-10-30, that happened
+        exactly when the response was Shopee's 1.2 kB anti-bot refusal
+        (90309999, confirmed once by intercepting the same request with the CDP
+        Fetch domain)."""
+        if not self._net:
+            self.p.call("Network.enable", maxResourceBufferSize=20_000_000, maxTotalBufferSize=60_000_000)
+            self.p.call("Page.enable")
+            self._net = True
+        self.p.events.clear()
+        if url:
+            self.p.call("Page.navigate", url=url)
+        if action_js:
+            self.eval(action_js)
+        t0 = time.time()
+        hits, rid_url, done_at = {}, {}, None
+        while time.time() - t0 < timeout:
+            self.p.pump(0.5)
+            evs, self.p.events = self.p.events, []
+            for e in evs:
+                m, prm = e["method"], e.get("params", {})
+                if m == "Network.responseReceived":
+                    u = prm["response"]["url"]
+                    for pat in patterns:
+                        if pat in u and pat not in hits:
+                            rid_url[prm["requestId"]] = (pat, prm["response"]["status"], u)
+                elif m == "Network.loadingFinished" and prm.get("requestId") in rid_url:
+                    pat, st, u = rid_url.pop(prm["requestId"])
+                    try:
+                        body = self.p.call("Network.getResponseBody", requestId=prm["requestId"])["body"]
+                    except Net:
+                        body = None
+                    hits[pat] = (st, u, body)
+                elif m == "Page.frameNavigated" and not prm.get("frame", {}).get("parentId"):
+                    fu = prm["frame"].get("url", "")
+                    if is_challenge_url(fu):
+                        raise Blocked("Shopee redirected the background tab to a verification/login "
+                                      f"page ({fu[:160]}); not solved by this CLI")
+            if all(p in hits for p in patterns):
+                if done_at is None:
+                    done_at = time.time()
+                if time.time() - done_at >= settle or settle == 0:
+                    break
+        if self.debug:
+            print(f"[tab] {url} -> {[(k, v[0], len(v[2] or '')) for k, v in hits.items()]}", file=sys.stderr)
+        if not hits and url:
+            href = self.eval("location.href") or ""
+            if is_challenge_url(href):
+                raise Blocked(f"Shopee showed a verification/login page: {href[:160]}")
+        return hits
+
+    def close(self):
+        # Edge quits (clean exit) if the background tab we close is the last
+        # "page" target left - guard: if ours is the only page, leave it open
+        # (navigate to about:blank) instead of closing it.
+        try:
+            targets = self.b.call("Target.getTargets").get("targetInfos", [])
+            pages = [t for t in targets if t.get("type") == "page"]
+            only_page_left = len(pages) <= 1 and any(t.get("targetId") == self.tid for t in pages)
+        except Exception:
+            only_page_left = False
+        try:
+            if only_page_left:
+                self.p.call("Page.navigate", url="about:blank")
+            else:
+                self.b.call("Target.closeTarget", targetId=self.tid)
+        except Exception:
+            pass
+        for w in (getattr(self, "p", None), getattr(self, "b", None)):
+            if w:
+                w.close()
+
+
+def _signed_in(cookies):
+    """SPC_U is the numeric user id when signed in, "-" when signed out (measured)."""
+    for c in cookies or []:
+        if c.get("name") == "SPC_U":
+            return c.get("value") not in (None, "", "-")
+    return False
+
+
+def _cookie_val(cookies, name):
+    for c in cookies or []:
+        if c.get("name") == name:
+            return c.get("value")
+    return None
+
+
+# ------------------------------------------------------------------ pacing
+def min_interval():
+    try:
+        return max(0.0, float(os.environ.get("SHOPEE_MIN_INTERVAL", MIN_INTERVAL_DEFAULT)))
+    except ValueError:
+        return MIN_INTERVAL_DEFAULT
+
+
+def _cooldown_left():
+    try:
+        with open(COOLDOWN_FILE, encoding="utf-8") as f:
+            return float(f.read().strip() or 0) - time.time()
+    except (OSError, ValueError):
+        return 0
+
+
+def _pace():
+    """Built-in human-rate pacing shared by every `shopee` process: at least
+    SHOPEE_MIN_INTERVAL seconds (default 9) between Shopee requests (timestamp
+    file ~/.config/shopee/.last_request), and no request at all while a recorded
+    cool-down (after a 429 / 90309999 / captcha) is running."""
+    left = _cooldown_left()
+    if left > 0:
+        raise Net(f"Shopee cool-down active: {int(left // 60)} min {int(left % 60)} s left after the last "
+                  f"block. Not sending anything (delete {COOLDOWN_FILE} to override at your own risk)")
+    gap = min_interval()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    stamp = os.path.join(STATE_DIR, ".last_request")
+    try:
+        last = os.path.getmtime(stamp)
+    except OSError:
+        last = 0
+    wait = last + gap - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    with open(stamp, "w"):
+        pass
+    os.utime(stamp, None)
+
+
+def announce(n_requests, what):
+    """Tell the user up front how long a multi-request command will take."""
+    if n_requests > 1:
+        secs = int((n_requests - 1) * min_interval())
+        print(f"note: {what} needs {n_requests} Shopee requests, paced {min_interval():g}s apart "
+              f"(about {secs // 60} min {secs % 60} s)", file=sys.stderr)
+
+
+# ------------------------------------------------------------------ state
+def _keyring(op, secret=None, acct="default"):
+    try:
+        if sys.platform == "darwin":
+            cmd = {"set": ["security", "add-generic-password", "-U", "-a", acct,
+                           "-s", KEYRING_SERVICE, "-w", secret],
+                   "get": ["security", "find-generic-password", "-a", acct, "-s", KEYRING_SERVICE, "-w"],
+                   "del": ["security", "delete-generic-password", "-a", acct, "-s", KEYRING_SERVICE]}[op]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            base = ["service", KEYRING_SERVICE, "account", acct]
+            cmd = {"set": ["secret-tool", "store", "--label=shopee-cli"] + base,
+                   "get": ["secret-tool", "lookup"] + base,
+                   "del": ["secret-tool", "clear"] + base}[op]
+            r = subprocess.run(cmd, input=secret if op == "set" else None,
+                               capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Auth("no keyring tool (macOS `security` / Linux `secret-tool`)")
+    if op == "get":
+        return r.stdout.strip() if r.returncode == 0 else None
+    if op == "set" and r.returncode != 0:
+        raise Auth("keyring write failed: " + r.stderr.strip())
+    return True
+
+
+def keyring_save(cookies):
+    blob = json.dumps(cookies, separators=(",", ":"))
+    parts = [blob[i:i + KR_CHUNK] for i in range(0, len(blob), KR_CHUNK)]
+    for i, part in enumerate(parts):
+        _keyring("set", part, f"default.{i}")
+    return len(parts)
+
+
+def keyring_load(n):
+    parts = [_keyring("get", acct=f"default.{i}") for i in range(n or 0)]
+    if not n or any(p is None for p in parts):
+        raise Auth("saved keyring session is missing - run `shopee login --keyring`")
+    try:
+        return json.loads("".join(parts))
+    except ValueError:
+        raise Auth("saved keyring session is corrupt - run `shopee login --keyring`")
+
+
+def keyring_clear(n):
+    for i in range(max(n or 0, 1)):
+        _keyring("del", acct=f"default.{i}")
+    _keyring("del")
+
+
+def header_to_cookies(header):
+    return [{"name": p.split("=", 1)[0].strip(), "value": p.split("=", 1)[1].strip(), "domain": ".shopee.tw"}
+            for p in header.split(";") if "=" in p]
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {}
+    env_cookie = os.environ.get("SHOPEE_COOKIE")
+    if env_cookie:
+        st["cookies"] = header_to_cookies(env_cookie)
+        st["source"] = "SHOPEE_COOKIE env"
+        st["ua"] = os.environ.get("SHOPEE_UA") or DEFAULT_UA
+        return st
+    if st.get("cookie_in_keyring"):
+        try:
+            st["cookies"] = keyring_load(st.get("keyring_parts"))
+            st["source"] = "OS keyring"
+        except Auth as e:
+            st["keyring_error"] = str(e)
+            st["cookies"] = []
+    elif st.get("cookies"):
+        st["source"] = STATE_FILE
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    data = dict(st)
+    if data.get("cookie_in_keyring"):
+        data.pop("cookies", None)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def clean_cookie(text):
+    text = (text or "").strip()
+    if text.lower().startswith("cookie:"):
+        text = text[7:].strip()
+    pairs = [p.strip() for p in text.replace("\n", ";").split(";") if "=" in p]
+    return "; ".join(pairs)
+
+
+def cookie_header(cookies):
+    seen, parts = set(), []
+    for c in cookies or []:
+        if "name" in c and "value" in c and c["name"] not in seen:
+            seen.add(c["name"])
+            parts.append(f"{c['name']}={c['value']}")
+    return "; ".join(parts)
+
+
+# -------------------------------------------------------------- transport
+BLOCK_CODES = (90309999,)  # Shopee anti-bot reply: {"error":90309999,...,"9":true}
+
+
+def _json(text, what):
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise ApiError(f"{what}: non-JSON reply", {"body": (text or "")[:300]})
+
+
+def _check_block(d, what, via):
+    if isinstance(d, dict) and d.get("error") in BLOCK_CODES:
+        hint = ("plain HTTPS is not signed; use --via browser" if via == "http" else
+                "even the real page's own signed request was refused - Shopee has flagged this "
+                "browser/account for now (measured after ~40 requests in ~45 min)" if via == "page" else
+                "Shopee anti-bot refused the signed in-page XHR")
+        raise Blocked(f"{what}: blocked by Shopee anti-bot (error {d['error']}, tracking "
+                      f"{d.get('1') or d.get('tracking_id')}); {hint}", wait=600 if via == "page" else 180)
+    return d
+
+
+class Http:
+    """Plain HTTPS with the saved cookies + Edge UA. Measured 2026-10-30:
+    /api/v4/search/search_items -> HTTP 403 {"error":90309999} (unsigned)."""
+
+    def __init__(self, st, debug=False):
+        self.st, self.debug = st, debug
+        self.ua = os.environ.get("SHOPEE_UA") or st.get("ua") or DEFAULT_UA
+
+    def request(self, method, url, body=None, headers=None):
+        if not url.startswith("http"):
+            url = ORIGIN + url
+        h = {"User-Agent": self.ua, "Accept": "application/json",
+             "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8", "Referer": ORIGIN + "/",
+             "X-Requested-With": "XMLHttpRequest", "X-Shopee-Language": "zh-Hant", "X-API-SOURCE": "pc"}
+        ck = cookie_header(self.st.get("cookies"))
+        if ck:
+            h["Cookie"] = ck
+            tok = _cookie_val(self.st.get("cookies"), "csrftoken")
+            if tok:
+                h["X-CSRFToken"] = tok
+        h.update(headers or {})
+        data = None
+        if body is not None:
+            data = (body if isinstance(body, str) else json.dumps(body)).encode()
+            h.setdefault("Content-Type", "application/json")
+        _pace()
+        req = urllib.request.Request(url, data=data, headers=h, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                code, text = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            code, text = e.code, e.read().decode("utf-8", "replace")
+        except OSError as e:
+            raise Net(f"shopee.tw: {e}")
+        if self.debug:
+            print(f"[http] {method} {url} -> {code} {text[:200]}", file=sys.stderr)
+        return code, text
+
+
+class Client:
+    """One background tab in the real Edge, created lazily. Reads: page_api()
+    (the page's own signed request). Writes / raw: api() = signed in-page XHR,
+    or plain HTTPS for endpoints measured to work over it (get_account_info)
+    and for --via http. Plain HTTPS is never tried first for endpoints measured
+    to refuse it, so the bot detector is not fed pointless unsigned calls."""
+
+    def __init__(self, args, st=None, need_session=False):
+        self.args = args
+        self.via = getattr(args, "via", "auto") or "auto"
+        self.debug = getattr(args, "debug", False)
+        self.st = st if st is not None else load_state()
+        self.http = Http(self.st, self.debug)
+        self.need_session = need_session
+        self.br = None
+
+    def browser(self):
+        """Open (once) the single background tab. It starts on about:blank so the
+        first thing Shopee sees is the real page we navigate to."""
+        if self.br is None:
+            _set_cdp(getattr(self.args, "cdp", None))
+            self._before, _ = edge_cookies()
+            if self.need_session:
+                self._check_session_matches(self._before)
+            self.br = Browser(self.debug, url="about:blank", wait=False)
+        return self.br
+
+    def _check_logout(self):
+        after, _ = edge_cookies()
+        b = self._before
+        if (_signed_in(b) and not _signed_in(after)) or (_cookie_val(b, "SPC_ST") and not _cookie_val(after, "SPC_ST")):
+            raise Auth("Shopee signed the Edge session out while the background tab loaded "
+                       "(SPC_U reset to '-' or SPC_ST deleted); sign in again in Edge, then `shopee login`")
+
+    def page_api(self, url, pattern, what=None):
+        """Navigate the background tab to a real shopee.tw page and return the JSON
+        of the page's OWN request matching `pattern` (signed by the page itself).
+        Measured 2026-10-30: these were 200 on every load, whereas our own
+        in-page XHRs were refused (90309999) about 2 times in 3."""
+        what = what or pattern
+        if self.via == "http":
+            raise Usage(f"{what} is read from the real page in Edge (plain HTTPS is refused with "
+                        "90309999, measured); --via http only applies to whoami/login/raw")
+        _pace()
+        br = self.browser()
+        hits = br.capture(url, [pattern], timeout=30, settle=0)
+        self._check_logout()
+        self._on_shopee = True
+        self._loaded_at = time.time()
+        if pattern not in hits:
+            href = br.eval("location.href") or ""
+            title = br.eval("document.title") or ""
+            if "429" in title or "Too Many" in title:
+                raise Blocked(f"{what}: Shopee answered the page with '{title}' (rate limit)")
+            if is_challenge_url(href):
+                raise Blocked(f"{what}: Shopee showed a verification page ({href[:140]}); not solved by this CLI")
+            raise ApiError(f"{what}: the page did not request {pattern} (page: {href[:140]})")
+        status, u, body = hits[pattern]
+        if status == 429:
+            raise Blocked(f"{what}: Shopee answered HTTP 429 (rate limit)")
+        if body is None:
+            raise Blocked(f"{what}: Shopee refused the page's own request (HTTP {status}, no body kept; "
+                          "measured to be the anti-bot reply 90309999)", wait=600)
+        d = _check_block(_json(body, what), what, "page")
+        if isinstance(d, dict):
+            d.setdefault("_request_url", u)
+        return d
+
+    def _ensure_page(self):
+        br = self.browser()
+        if not getattr(self, "_on_shopee", False):
+            _pace()
+            br.navigate(ORIGIN + "/")
+            self._check_logout()
+            self._on_shopee = True
+            self._loaded_at = time.time()
+        # measured: XHRs fired right after a page load were refused (90309999)
+        wait = getattr(self, "_loaded_at", 0) + 8 - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        return br
+
+    def _check_session_matches(self, edge):
+        saved = _cookie_val(self.st.get("cookies"), "SPC_U")
+        if not saved or saved == "-":
+            raise Auth(self.st.get("keyring_error") or "not signed in - run `shopee login`")
+        live = _cookie_val(edge, "SPC_U")
+        if live != saved:
+            raise Auth(f"saved session is user {saved} but Edge on {CDP} is "
+                       f"{'signed out' if live in (None, '-') else 'user ' + str(live)}; "
+                       "the signed transport runs in Edge, so sign in there as the same user "
+                       "and run `shopee login` again")
+
+    def api(self, method, path, body=None, what=None, http_ok=False):
+        """JSON API call. http_ok=True marks endpoints measured to work over plain HTTPS."""
+        what = what or path.split("?")[0]
+        if self.via == "http" or (self.via == "auto" and http_ok):
+            code, text = self.http.request(method, path, body)
+            d = _json(text, what)
+            if self.via == "http" or not (isinstance(d, dict) and d.get("error") in BLOCK_CODES):
+                return code, _check_block(d, what, "http")
+        br = self._ensure_page()
+        _pace()
+        code, text = br.xhr(method, path, body)
+        if code == 0:
+            raise Net(f"{what}: {text}")
+        return code, _check_block(_json(text, what), what, "browser")
+
+    def close(self):
+        if self.br:
+            self.br.close()
+            self.br = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+# ------------------------------------------------------------- ids / urls
+def parse_ref(ref):
+    """'<shopid>.<itemid>', '<shopid>/<itemid>', or a shopee.tw product URL
+    (/product/<shopid>/<itemid> or ...-i.<shopid>.<itemid>) -> (shopid, itemid)."""
+    s = str(ref).strip()
+    m = (re.search(r"-i\.(\d+)\.(\d+)", s) or re.search(r"/product/(\d+)/(\d+)", s)
+         or re.fullmatch(r"(\d+)[./:](\d+)", s))
+    if not m:
+        raise Usage(f"not a Shopee product reference: {ref!r} (use <shopid>.<itemid> or a shopee.tw product URL)")
+    return int(m.group(1)), int(m.group(2))
+
+
+def product_url(shopid, itemid):
+    return f"{ORIGIN}/product/{shopid}/{itemid}"
+
+
+# ------------------------------------------------------------------ search
+SORTS = {  # CLI name -> (Shopee `by`, `order`)
+    "relevance": ("relevancy", "desc"),
+    "price": ("price", "asc"),
+    "price-asc": ("price", "asc"),
+    "price-desc": ("price", "desc"),
+    "sales": ("sales", "desc"),
+    "newest": ("ctime", "desc"),
+}
+BACKEND_LIMIT = 60          # items per search_items call (what the web app asks for)
+PRICE_POOL_PAGES = 2        # backend pages pooled for client-side price sort
+MAX_BACKEND_PAGES = 6       # safety cap per CLI call
+
+
+def _tracking(it):
+    for k in ("search_item_tracking", "bff_item_tracking"):
+        try:
+            v = json.loads(it.get(k) or "{}")
+            if v:
+                return v
+        except ValueError:
+            pass
+    return {}
+
+
+def is_ad(it):
+    tr = _tracking(it)
+    return bool(it.get("adsid") or it.get("campaignid") or tr.get("is_ads")
+                or (tr.get("item_type_str") not in (None, "", "organic")))
+
+
+def parse_search_item(it):
+    b = it.get("item_basic") or {}
+    d = it.get("item_data") or {}
+    asset = it.get("item_card_displayed_asset") or {}
+    card = (b.get("item_card_display_price") or d.get("item_card_display_price") or {})
+    shopid, itemid = it.get("shopid") or b.get("shopid"), it.get("itemid") or b.get("itemid")
+    hidden = b.get("hidden_price_display") or card.get("hidden_price_display_text")
+    if b:
+        pmin, pmax = b.get("price_min"), b.get("price_max")
+        omin = b.get("price_min_before_discount")
+        name = b.get("name")
+        rating = (b.get("item_rating") or {}).get("rating_star")
+        reviews = b.get("cmt_count")
+        sold = b.get("historical_sold")
+        stock = b.get("stock")
+        sold_out = b.get("stock") == 0 if b.get("stock") is not None else None
+        loc = b.get("shop_location")
+        official = bool(b.get("is_official_shop"))
+        shop_name = None
+    else:  # "item_data" card format (what the SSR'd search page itself requests)
+        # measured 60/60: applied_product_promo_price == item_basic.price_min
+        pmin, pmax = card.get("applied_product_promo_price", card.get("price")), None
+        omin = card.get("original_price")
+        name = asset.get("name")
+        rating = (d.get("item_rating") or {}).get("rating_star")
+        reviews = ((d.get("item_rating") or {}).get("rating_count") or [None])[0]
+        sold = (d.get("item_card_display_sold_count") or {}).get("historical_sold_count")
+        stock = None
+        sold_out = d.get("is_sold_out")
+        loc = asset.get("shop_location")
+        official = None
+        shop_name = (d.get("shop_data") or {}).get("shop_name")
+    voucher = card.get("recommended_shop_voucher_info") or card.get("recommended_platform_voucher_info")
+    price = None if hidden else twd(pmin)
+    out = {
+        "id": f"{shopid}.{itemid}",
+        "shopid": shopid,
+        "itemid": itemid,
+        "title": name,
+        "price": price,                     # lowest variant price now (after product promo, before vouchers)
+        "price_max": None if hidden else twd(pmax),
+        "orig_price": twd(omin),
+        "discount_pct": b.get("raw_discount") if b else card.get("discount"),
+        "card_price": None if hidden else twd(card.get("price")),  # what the search card shows (may include a voucher)
+        "card_voucher": ({"code": voucher.get("voucher_code"), "discount": twd(voucher.get("voucher_discount")),
+                          "min_spend": twd(voucher.get("min_spend"))} if voucher else None),
+        "price_hidden": hidden or None,
+        "rating": round(rating, 2) if rating else None,
+        "reviews": reviews,
+        "sold": sold,
+        "stock": stock,
+        "sold_out": sold_out,
+        "shop_location": loc,
+        "official_shop": official,
+        "shop_name": shop_name,
+        "url": product_url(shopid, itemid),
+    }
+    return out
+
+
+def _search_page_url(keyword, sort, backend_page):
+    """The real search page; its own JS requests search_items with
+    newest = backend_page * 60 (measured, signed in) and the sort below."""
+    by, order = SORTS[sort]
+    q = [("keyword", keyword)]
+    if by != "relevancy":
+        q += [("order", order), ("sortBy", by)]
+    if backend_page:
+        q.append(("page", str(backend_page)))
+    return ORIGIN + "/search?" + urllib.parse.urlencode(q)
+
+
+def _dump(name, d):
+    dd = os.environ.get("SHOPEE_DUMP_DIR")
+    if dd:
+        os.makedirs(dd, exist_ok=True)
+        with open(os.path.join(dd, f"{int(time.time())}_{name}.json"), "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+
+
+# measured 2026-10-30: every NT$99,999 listing seen in a 衛生紙 price-desc pool was
+# a gift-only placeholder ("<贈品專用，請勿自行下單！>", "加價購 [完全贈品]").
+PLACEHOLDER_PRICE = 99999
+CACHE_TTL = int(os.environ.get("SHOPEE_CACHE_TTL", "600"))
+SESSION_TTL = 1800  # seconds a search session (ids + already-shown items) is reused
+
+
+def _search_session(key):
+    """Which ids each CLI page already showed for the same query+sort+filters+
+    limit (kept SESSION_TTL), so page N never repeats page <N even when the
+    result-page cache expired in between and Shopee reordered its results."""
+    try:
+        with open(SEARCH_FILE, encoding="utf-8") as f:
+            ss = json.load(f)
+    except (OSError, ValueError):
+        ss = {}
+    now = time.time()
+    ss = {k: v for k, v in ss.items() if now - v.get("ts", 0) < SESSION_TTL}
+    cur = ss.get(key)
+    if not cur:
+        cur = {"shown": {}}
+    cur["ts"] = now
+    ss[key] = cur
+    return ss, cur
+
+
+def _cache_file(keyword, sort, backend):
+    import hashlib
+    return os.path.join(STATE_DIR, "cache", hashlib.sha1(json.dumps([keyword, sort, backend], ensure_ascii=False)
+                                                        .encode()).hexdigest() + ".json")
+
+
+def _is_cached(keyword, sort, backend):
+    try:
+        return time.time() - os.path.getmtime(_cache_file(keyword, sort, backend)) < CACHE_TTL
+    except OSError:
+        return False
+
+
+def _cached_backend_page(cl, keyword, sort, backend, fresh=False):
+    """One Shopee result page (60), parsed, ads dropped (and counted). Cached for
+    CACHE_TTL so consecutive CLI pages are cut from the SAME Shopee data -
+    Shopee reorders its own results between calls (measured), and it rate-limits
+    page loads (HTML 429 after ~12 loads in ~10 min, measured)."""
+    fn = _cache_file(keyword, sort, backend)
+    cdir = os.path.dirname(fn)
+    if not fresh:
+        try:
+            if time.time() - os.path.getmtime(fn) < CACHE_TTL:
+                with open(fn, encoding="utf-8") as f:
+                    return dict(json.load(f), cached=True)
+        except (OSError, ValueError):
+            pass
+    d = cl.page_api(_search_page_url(keyword, sort, backend), "/api/v4/search/search_items", what="search_items")
+    _dump(f"search_{sort}_b{backend}", d)
+    if d.get("error"):
+        raise ApiError(f"search_items error {d.get('error')}: {d.get('error_msg')}", {"error": d.get("error")})
+    raw = d.get("items") or []
+    items = [parse_search_item(it) for it in raw if not is_ad(it)]
+    out = {"items": items, "raw": len(raw), "ads": len(raw) - len(items), "total_count": d.get("total_count"),
+           "nomore": d.get("nomore"), "fetched_at": int(time.time())}
+    os.makedirs(cdir, exist_ok=True)
+    with open(fn + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False)
+    os.replace(fn + ".tmp", fn)
+    return out
+
+
+def search_shopee(cl, keyword, sort="relevance", page=1, limit=20, min_price=None, max_price=None, fresh=False):
+    """Returns (items, meta). Every sort goes through one deduped, ad-free
+    stream/pool; see the module docstring for the measured reasons."""
+    by, order = SORTS[sort]
+    price_sort = by == "price"
+    key = json.dumps([keyword, sort, min_price, max_price, limit], ensure_ascii=False)
+    sessions, sess = _search_session(key)
+    earlier = [sess["shown"].get(str(p)) for p in range(1, page)]
+    have_earlier = all(e is not None for e in earlier)
+    excluded = {i for e in earlier if e for i in e} if have_earlier else set()
+    need = limit if have_earlier else page * limit
+    pool, seen = [], set()
+    meta = {"backend_pages": 0, "raw": 0, "dropped_ads": 0, "dropped_dupes": 0,
+            "dropped_hidden_price": 0, "dropped_shown_on_earlier_page": 0, "total_count": None,
+            "cached_pages": 0, "dropped_placeholder_99999": 0,
+            "paging": "exclude-earlier-pages" if have_earlier and page > 1 else "offset"}
+
+    def usable():
+        return [p for p in pool if p["id"] not in excluded
+                and (min_price is None or (p["price"] is not None and p["price"] >= min_price))
+                and (max_price is None or (p["price"] is not None and p["price"] <= max_price))]
+
+    if price_sort:
+        n_pages = min(MAX_BACKEND_PAGES, max(PRICE_POOL_PAGES, -(-(page * limit) // BACKEND_LIMIT) + 1))
+        todo = sum(1 for b in range(n_pages) if fresh or not _is_cached(keyword, sort, b))
+        announce(todo, f"--sort {sort} (pool of {n_pages} Shopee result pages, {todo} not cached)")
+    backend = 0
+    while backend < MAX_BACKEND_PAGES:
+        if price_sort and backend >= max(PRICE_POOL_PAGES, -(-(page * limit) // BACKEND_LIMIT) + 1):
+            break
+        if not price_sort and len(usable()) >= need:
+            break
+        page_data = _cached_backend_page(cl, keyword, sort, backend, fresh)
+        meta["backend_pages"] += 1
+        meta["cached_pages"] += 1 if page_data.get("cached") else 0
+        if meta["total_count"] is None:
+            meta["total_count"] = page_data.get("total_count")
+        meta["raw"] += page_data["raw"]
+        meta["dropped_ads"] += page_data["ads"]
+        for p in page_data["items"]:
+            k2 = (p["shopid"], p["itemid"])
+            if k2 in seen:
+                meta["dropped_dupes"] += 1
+                continue
+            seen.add(k2)
+            if price_sort and p["price"] is None:
+                meta["dropped_hidden_price"] += 1
+                continue
+            if p["price"] == PLACEHOLDER_PRICE:
+                meta["dropped_placeholder_99999"] += 1
+                continue
+            pool.append(p)
+        backend += 1
+        if page_data.get("nomore") or not page_data["raw"]:
+            break
+    meta["dropped_shown_on_earlier_page"] = sum(1 for p in pool if p["id"] in excluded)
+    cand = usable()
+    if price_sort:
+        cand.sort(key=lambda p: (p["price"], p["shopid"], p["itemid"]), reverse=(order == "desc"))
+    meta["pool"] = len(cand)
+    out = cand[:limit] if have_earlier else cand[(page - 1) * limit:page * limit]
+    sess["shown"][str(page)] = [p["id"] for p in out]
+    for p_ in [k for k in sess["shown"] if int(k) > page]:
+        sess["shown"].pop(p_)  # re-running page N invalidates later pages
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = SEARCH_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, ensure_ascii=False)
+    os.replace(tmp, SEARCH_FILE)
+    return out, meta
+
+
+def cmd_search(args):
+    if args.page < 1 or args.limit < 1:
+        raise Usage("--page and --limit must be >= 1")
+    with Client(args) as cl:
+        items, meta = search_shopee(cl, args.query, args.sort, args.page, args.limit, args.min, args.max,
+                                    fresh=args.fresh)
+    data = {"query": args.query, "sort": args.sort, "page": args.page, "limit": args.limit,
+            "price_basis": "price = lowest variant price (price_min, TWD) after product promotion, before vouchers",
+            "meta": meta, "items": items}
+
+    def human():
+        rows = []
+        for it in items:
+            rng = nt(it["price"]) + (f"~{it['price_max']:,.0f}" if it["price_max"] and it["price_max"] != it["price"] else "")
+            rows.append([it["id"], clip(it["title"], 40), rng, nt(it["orig_price"]) if it["orig_price"] != it["price"] else "",
+                         "" if it["rating"] is None else f"{it['rating']:.1f}", it["reviews"] or "",
+                         it["sold"] if it["sold"] is not None else "", it["url"]])
+        foot = (f"\n{len(items)} items (page {args.page}, pool {meta['pool']}, backend pages {meta['backend_pages']}; "
+                f"dropped ads {meta['dropped_ads']}, dupes {meta['dropped_dupes']}, hidden-price {meta['dropped_hidden_price']}, "
+                f"NT$99,999 gift placeholders {meta['dropped_placeholder_99999']})")
+        return table(rows, ["id", "商品", "價格", "原價", "評分", "評價", "已售", "url"]) + foot
+
+    return emit(ok(data), args.json, human)
+
+
+# ----------------------------------------------------------------- product
+def get_pdp(cl, shopid, itemid):
+    d = cl.page_api(product_url(shopid, itemid), "/api/v4/pdp/get_pc", what="pdp/get_pc")
+    _dump(f"pdp_{shopid}_{itemid}", d)
+    if d.get("error"):
+        raise ApiError(f"pdp/get_pc error {d.get('error')}: {d.get('error_msg')}", {"error": d.get("error")})
+    data = d.get("data") or {}
+    if not data.get("item"):
+        raise ApiError(f"product {shopid}.{itemid} not found", {"body": json.dumps(d)[:300]})
+    return parse_pdp(data, shopid, itemid)
+
+
+def cmd_product(args):
+    shopid, itemid = parse_ref(args.ref)
+    with Client(args) as cl:
+        p = get_pdp(cl, shopid, itemid)
+
+    def human():
+        lines = [p["title"] or "", p["url"], ""]
+        rng = nt(p["price"]) + (f" ~ {nt(p['price_max'])}" if p["price_max"] and p["price_max"] != p["price"] else "")
+        lines.append(f"價格:   {rng}" + (f"   (原價 {nt(p['orig_price'])}" + (f" ~ {nt(p['orig_price_max'])}" if p.get("orig_price_max") and p["orig_price_max"] != p["orig_price"] else "") + ")" if p["orig_price"] and p["orig_price"] != p["price"] else ""))
+        if p.get("promo"):
+            lines.append(f"促銷:   {p['promo']}")
+        lines.append(f"庫存:   {p['stock']}" + ("  (已售完)" if not p["in_stock"] else ""))
+        if p.get("brand"):
+            lines.append(f"品牌:   {p['brand']}")
+        lines.append(f"賣家:   {p['shop'].get('name') or ''} ({p['shopid']})" + (" 商城" if p['shop'].get('official') else "")
+                     + (f"  {p['shop_location']}" if p.get("shop_location") else ""))
+        if p.get("rating") is not None:
+            lines.append(f"評分:   {p['rating']:.2f} ({p['reviews']} 則評價)" + (f"  已售 {p['sold']}" if p.get("sold") is not None else ""))
+        if p.get("shipping"):
+            lines.append(f"運送:   {p['shipping']}")
+        if p["tiers"]:
+            lines.append("")
+            lines.append("規格: " + " / ".join(f"{t['name']}: {', '.join(t['options'])}" for t in p["tiers"]))
+        if p["models"]:
+            lines.append("")
+            rows = [[m["modelid"], clip(m["name"], 36), nt(m["price"]), nt(m["orig_price"]) if m["orig_price"] != m["price"] else "",
+                     m["stock"] if m["in_stock"] else "售完"] for m in p["models"]]
+            lines.append(table(rows, ["modelid", "規格", "價格", "原價", "庫存"]))
+        return "\n".join(lines)
+
+    return emit(ok(p), args.json, human)
+
+
+def cmd_price(args):
+    refs = [parse_ref(r) for r in args.refs]
+    announce(len(refs), f"price for {len(refs)} products")
+    out = []
+    with Client(args) as cl:
+        for shopid, itemid in refs:
+            try:
+                p = get_pdp(cl, shopid, itemid)
+                out.append({"id": p["id"], "title": p["title"], "price": p["price"], "price_max": p["price_max"],
+                            "orig_price": p["orig_price"], "discount_pct": p["discount_pct"], "in_stock": p["in_stock"],
+                            "stock": p["stock"], "models": len(p["models"]), "url": p["url"],
+                            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+            except Blocked:
+                raise
+            except (ApiError, Net) as e:
+                out.append({"id": f"{shopid}.{itemid}", "error": str(e), "url": product_url(shopid, itemid)})
+
+    def human():
+        rows = [[o["id"], clip(o.get("title"), 40),
+                 (nt(o.get("price")) + (f"~{o['price_max']:,.0f}" if o.get("price_max") and o["price_max"] != o["price"] else "")) if "error" not in o else "ERR",
+                 nt(o.get("orig_price")) if o.get("orig_price") != o.get("price") else "",
+                 ("有貨" if o.get("in_stock") else "售完") if "error" not in o else o["error"][:40]] for o in out]
+        return table(rows, ["id", "商品", "價格", "原價", "庫存"])
+
+    return emit(ok(out), args.json, human)
+
+
+def cmd_raw(args):
+    path = args.path
+    if path.startswith(ORIGIN):
+        path = path[len(ORIGIN):]
+    if not path.startswith("/"):
+        path = "/" + path
+    with Client(args) as cl:
+        code, d = cl.api("GET", path, what="raw")
+    return emit(ok(d), args.json)
+
+
+# ------------------------------------------------------------------- login
+LOGIN_URL = ORIGIN + "/buyer/login"
+
+
+def fetch_account(cookies, ua, via="http", args=None):
+    """GET /api/v4/account/basic/get_account_info with the given session."""
+    st = {"cookies": cookies, "ua": ua}
+    if via == "http":
+        code, text = Http(st, getattr(args, "debug", False)).request("GET", "/api/v4/account/basic/get_account_info")
+        d = _check_block(_json(text, "get_account_info"), "get_account_info", "http")
+    else:
+        with Client(args, st, need_session=True) as cl:
+            _, d = cl.api("GET", "/api/v4/account/basic/get_account_info", what="get_account_info")
+    data = d.get("data") if isinstance(d, dict) else None
+    if d.get("error") or not data or not data.get("userid"):
+        raise Auth(f"session rejected by get_account_info (error {d.get('error')}) - run `shopee login`")
+    return {"userid": data.get("userid"), "username": data.get("username"), "nickname": data.get("nickname"),
+            "email": data.get("email"), "phone": data.get("phone"), "shopid": data.get("shopid")}
+
+
+def _verify(cookies, ua, args):
+    try:
+        return fetch_account(cookies, ua, "http", args), "http"
+    except Blocked:
+        return fetch_account(cookies, ua, "browser", args), "browser"
+
+
+def _clipboard():
+    for cmd in (["wl-paste", "-n"], ["pbpaste"], ["xclip", "-o", "-selection", "clipboard"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    raise Auth("clipboard is empty or no clipboard tool (wl-paste / pbpaste / xclip)")
+
+
+def cmd_login(args):
+    _set_cdp(args.cdp)
+    if args.from_clipboard or args.cookie_stdin:
+        raw = _clipboard() if args.from_clipboard else sys.stdin.read()
+        cookies = header_to_cookies(clean_cookie(raw))
+        if not _signed_in(cookies):
+            raise Auth("that Cookie header has no signed-in SPC_U; copy it from a logged-in shopee.tw request")
+        ua = os.environ.get("SHOPEE_UA") or DEFAULT_UA
+        src = "clipboard" if args.from_clipboard else "stdin"
+    else:
+        cookies, ua = edge_cookies()
+        if not _signed_in(cookies):
+            print(f"Not signed in on shopee.tw in Edge ({CDP}). Opening the sign-in page in a background "
+                  f"tab; sign in there yourself (waiting up to {args.wait}s). This CLI never types passwords/OTP.",
+                  file=sys.stderr)
+            br = Browser(args.debug, LOGIN_URL, wait=False)
+            try:
+                t0 = time.time()
+                while time.time() - t0 < args.wait:
+                    time.sleep(4)
+                    cookies, ua = edge_cookies()
+                    if _signed_in(cookies):
+                        break
+                else:
+                    raise Auth(f"not signed in after {args.wait}s - sign in on shopee.tw in Edge and retry")
+            finally:
+                br.close()
+        src = f"browser {CDP}"
+    user, verified_via = _verify(cookies, ua, args)
+    st = load_state()
+    if st.get("keyring_parts"):
+        keyring_clear(st["keyring_parts"])
+    for k in ("keyring_parts", "keyring_error", "source"):
+        st.pop(k, None)
+    st.update(cookies=cookies, ua=ua, cookie_in_keyring=bool(args.keyring), user=user,
+              logged_in_at=int(time.time()), login_source=src)
+    if args.keyring:
+        st["keyring_parts"] = keyring_save(cookies)
+        if keyring_load(st["keyring_parts"]) != cookies:
+            raise Auth("keyring verification failed; use the state file")
+    save_state(st)
+    out = {"user": user, "verified_via": verified_via, "cookies_count": len(cookies),
+           "stored": "keyring" if args.keyring else STATE_FILE, "source": src}
+    return emit(ok(out), args.json, lambda: (
+        f"Signed in as {user.get('username')} (userid {user.get('userid')}); verified via {verified_via}; "
+        f"session ({len(cookies)} cookies) saved to {out['stored']}"))
+
+
+def cmd_logout(args):
+    st = load_state()
+    if st.get("cookie_in_keyring"):
+        keyring_clear(st.get("keyring_parts"))
+    for k in ("cookies", "cookie_in_keyring", "keyring_parts", "keyring_error", "user",
+              "logged_in_at", "login_source", "source", "ua"):
+        st.pop(k, None)
+    save_state(st)
+    return emit(ok({"logged_out": True, "note": "only the CLI's saved session was deleted; Edge is untouched"}),
+                args.json, "Saved Shopee session removed (Edge's own sign-in is untouched).")
+
+
+def cmd_whoami(args):
+    st = load_state()
+    cookies = st.get("cookies")
+    if not cookies:
+        raise Auth(st.get("keyring_error") or "not signed in - run `shopee login`")
+    via = "browser" if args.via == "browser" else "http"
+    try:
+        u = fetch_account(cookies, st.get("ua") or DEFAULT_UA, via, args)
+    except Blocked:
+        if args.via == "http":
+            raise
+        via = "browser"
+        u = fetch_account(cookies, st.get("ua") or DEFAULT_UA, via, args)
+    out = dict(u, logged_in=True, verified_via=via, cookies_count=len(cookies), source=st.get("source"))
+    return emit(ok(out), args.json, lambda: (
+        f"{u.get('username')}" + (f" ({u['nickname']})" if u.get("nickname") else "") + f"  userid {u.get('userid')}\n"
+        f"email:   {u.get('email') or ''}\nphone:   {u.get('phone') or ''}\n"
+        f"驗證:    get_account_info via {via}\nSession: {out['source']} ({len(cookies)} cookies)"))
+
+
+# -------------------------------------------------------------------- cart
+CART_URL = ORIGIN + "/cart"
+
+
+def _brief_key(b):
+    return (int(b["shopid"]), int(b["itemid"]), int(b.get("modelid") or 0))
+
+
+def load_cart(cl):
+    """Open the real cart page in the background tab and read the page's own
+    /api/v4/cart/get reply. It lists EVERY line (cart_block_id_list item_briefs:
+    shopid/itemid/modelid/quantity) but details (name, price, stock, checkout
+    flag) only for the first pagination_info.item_limit lines (20, measured). The
+    page loads the rest on scroll via an observer that does not fire in a hidden
+    background tab (8 scrolls measured: no further cart/get), so lines past 20
+    are listed without name/price."""
+    d = cl.page_api(CART_URL, "/api/v4/cart/get", what="cart/get")
+    _dump("cart_get", d)
+    if d.get("error"):
+        raise ApiError(f"cart/get error {d.get('error')}: {d.get('error_msg')}", {"error": d.get("error")})
+    data = d.get("data") or {}
+    briefs = [b for blk in data.get("cart_block_id_list") or [] for b in blk.get("item_briefs") or []]
+    details = {}
+
+    def absorb(dd):
+        for blk in (dd.get("data") or {}).get("cart_blocks") or []:
+            shopname = ((blk.get("shops") or [{}])[0] or {}).get("shopname")
+            for it in blk.get("items") or []:
+                details[_brief_key(it)] = dict(it, _shopname=shopname)
+
+    absorb(d)
+    lines = []
+    for n, b in enumerate(briefs, 1):
+        it = details.get(_brief_key(b)) or {}
+        price = twd(it.get("price")) if it else None
+        q = b.get("quantity")
+        lines.append({
+            "line": n, "shopid": b["shopid"], "itemid": b["itemid"], "modelid": b.get("modelid"),
+            "id": f"{b['shopid']}.{b['itemid']}",
+            "title": it.get("name"), "spec": it.get("model_name") or None,
+            "quantity": q, "unit_price": price,
+            "subtotal": price * q if price is not None and q else None,
+            "selected": it.get("checkout") if it else None,
+            "status": it.get("status"), "stock": it.get("stock"),
+            "shop": it.get("_shopname"),
+        })
+    return {"lines": lines, "line_count": len(lines), "detailed": len(details),
+            "selected_count": sum(1 for x in lines if x["selected"]),
+            "selected_total": sum(x["subtotal"] or 0 for x in lines if x["selected"])}
+
+
+def _cart_client(args):
+    st = load_state()
+    if not st.get("cookies"):
+        raise Auth(st.get("keyring_error") or "cart commands need a saved session - run `shopee login`")
+    return Client(args, st, need_session=True)
+
+
+def cmd_cart_list(args):
+    with _cart_client(args) as cl:
+        cart = load_cart(cl)
+    out = cart
+
+    def human():
+        if not cart["lines"]:
+            return "購物車是空的"
+        rows = [[x["line"], x["id"], clip(x["title"] or "(未載入明細)", 34), clip(x["spec"] or "", 14), x["quantity"],
+                 nt(x["unit_price"]), nt(x["subtotal"]), "v" if x["selected"] else "",
+                 "" if x["status"] in (1, None) and (x["stock"] or 0) > 0 else "不可購買" if x["status"] is not None else ""]
+                for x in cart["lines"]]
+        return (table(rows, ["#", "id", "商品", "規格", "數量", "單價", "小計", "勾選", "狀態"]) +
+                f"\n{cart['line_count']} 項 (明細載入 {cart['detailed']}); 已勾選 {cart['selected_count']} 項 "
+                f"{nt(cart['selected_total'])} (未含運費/優惠券)")
+
+    return emit(ok(out), args.json, human)
+
+
+CART_WRITES_DISABLED = (
+    "cart writes are disabled: Shopee's anti-bot refused the in-page API write (add_to_cart -> "
+    "90309999, 3/3 attempts on 2026-10-30, cart verified unchanged), and driving the real buttons "
+    "was declined to protect the user's account (it is also their seller shop). Change the cart in "
+    "Edge yourself; `shopee cart list` is read-only and still works")
+
+
+def cmd_cart_write(args):
+    """cart add/qty/rm: refused up front (exit 2, no Shopee request is made)."""
+    raise Usage(CART_WRITES_DISABLED)
+
+
+def parse_pdp(data, shopid, itemid):
+    """/api/v4/pdp/get_pc data -> product dict. Price fields (measured): item.price_min
+    / price_max are the variant range now (after product promotion); models[].price per
+    variant; product_price.price.single_value / range_* is the voucher-applied "券後價"
+    when product_price.has_final_price (e.g. 995 -> 915 with shop voucher NT$80)."""
+    it = data.get("item") or {}
+    shop = data.get("shop_detailed") or {}
+    pp = data.get("product_price") or {}
+    hidden = it.get("hidden_price_display") or pp.get("hide_price") or None
+    tiers = [{"name": t.get("name"), "options": t.get("options") or []} for t in it.get("tier_variations") or []
+             if t.get("name") or t.get("options")]
+    models = []
+    for m in it.get("models") or []:
+        idx = (m.get("extinfo") or {}).get("tier_index") or []
+        models.append({
+            "modelid": m.get("model_id"),
+            "name": m.get("name"),
+            "tier_index": idx,
+            "price": None if hidden else twd(m.get("price")),
+            "orig_price": twd(m.get("price_before_discount")) or (None if hidden else twd(m.get("price"))),
+            "stock": m.get("stock") if m.get("stock") is not None else ("有貨" if m.get("has_stock") else 0),
+            "in_stock": bool(m.get("has_stock")) and not m.get("is_grayout") and m.get("status", 1) == 1,
+        })
+    fp = pp.get("price") or {}
+    final = None
+    if pp.get("has_final_price"):
+        v = fp.get("single_value")
+        final = {"price": twd(v) if v and v > 0 else twd(fp.get("range_min")),
+                 "price_max": twd(fp.get("range_max")) if (fp.get("range_max") or -1) > 0 else None,
+                 "hint": (pp.get("final_price_info") or {}).get("hint_text"),
+                 "vouchers": [v_.get("voucher_code") for v_ in pp.get("final_price_vouchers") or []]}
+    ship = data.get("product_shipping") or {}
+    chans = [c.get("name") for c in ship.get("ungrouped_channel_infos") or [] if c.get("name")]
+    feep = (ship.get("shipping_fee_info") or {}).get("price") or {}
+    if (feep.get("single_value") or -1) >= 0:
+        fee_txt = f" (運費 {nt(twd(feep['single_value']))})"
+    elif (feep.get("range_min") or -1) >= 0:
+        fee_txt = f" (運費 {nt(twd(feep['range_min']))}~{twd(feep.get('range_max')):,.0f})"
+    else:
+        fee_txt = ""
+    rev = data.get("product_review") or {}
+    any_stock = any(m["in_stock"] for m in models) if models else (it.get("stock") or 0) > 0 or it.get("stock_display") == "尚有庫存"
+    in_stock = bool(any_stock) and not it.get("is_unavailable") and it.get("status", 1) == 1
+    return {
+        "id": f"{shopid}.{itemid}",
+        "shopid": shopid,
+        "itemid": itemid,
+        "title": it.get("title"),
+        "brand": it.get("brand") or None,
+        "price": None if hidden else twd(it.get("price_min")),
+        "price_max": None if hidden else twd(it.get("price_max")),
+        "orig_price": twd(it.get("price_min_before_discount")),
+        "orig_price_max": twd(it.get("price_max_before_discount")),
+        "discount_pct": it.get("raw_discount"),
+        "final_price": final,
+        "price_hidden": hidden,
+        "promo": ", ".join(x for x in [
+            (f"{(final['hint'] or '券後價').rstrip(' >')} {nt(final['price'])} ({'/'.join(final['vouchers'])})" if final else None),
+            ("免運" if it.get("is_free_shipping") else None)] if x) or None,
+        "stock": it.get("stock") if it.get("stock") is not None else it.get("stock_display"),
+        "in_stock": in_stock,
+        "max_quantity": it.get("max_quantity"),
+        "rating": rev.get("rating_star") or (it.get("item_rating") or {}).get("rating_star"),
+        "reviews": rev.get("total_rating_count"),
+        "sold": rev.get("historical_sold"),
+        "shop": {"name": shop.get("name"), "official": bool(shop.get("is_official_shop")),
+                 "rating": shop.get("rating_star")},
+        "shop_location": it.get("shop_location") or shop.get("shop_location"),
+        "shipping": ", ".join(chans) + fee_txt if chans else None,
+        "tiers": tiers,
+        "models": models,
+        "url": product_url(shopid, itemid),
+    }
+
+
+# ------------------------------------------------------------------ doctor
+def cmd_doctor(args):
+    """Cheap by design: CDP + Edge cookies are local; the only Shopee request is
+    one plain-HTTPS get_account_info for the saved session (paced). `--live`
+    additionally loads one search page in a background tab."""
+    _set_cdp(args.cdp)
+    checks = []
+    st = load_state()
+    edge = None
+    try:
+        ver = _http_json("/json/version")
+        checks.append(("cdp", True, f"{ver.get('Browser')} on {CDP}"))
+        edge, _ = edge_cookies()
+        checks.append(("edge_signed_in", _signed_in(edge),
+                       f"shopee.tw SPC_U={_cookie_val(edge, 'SPC_U')}, SPC_ST "
+                       f"{'present' if _cookie_val(edge, 'SPC_ST') else 'missing'}"))
+    except Net as e:
+        checks.append(("cdp", False, str(e)))
+    left = _cooldown_left()
+    checks.append(("cooldown", left <= 0, "none" if left <= 0 else f"{int(left)} s left (after a Shopee block)"))
+    checks.append(("pacing", True, f"{min_interval():g} s between requests (SHOPEE_MIN_INTERVAL), "
+                                   f"result-page cache {CACHE_TTL} s"))
+    saved = st.get("cookies") or []
+    checks.append(("saved_session", _signed_in(saved),
+                   f"{st.get('source') or 'none'} ({len(saved)} cookies, SPC_U={_cookie_val(saved, 'SPC_U')})"))
+    if _signed_in(saved) and left <= 0:
+        try:
+            u = fetch_account(saved, st.get("ua") or DEFAULT_UA, "http", args)
+            checks.append(("login_http", True, f"{u.get('username')} (userid {u.get('userid')}) via plain HTTPS"))
+            if edge is not None and _cookie_val(edge, "SPC_U") != _cookie_val(saved, "SPC_U"):
+                checks.append(("edge_matches_saved", False, "Edge is signed in as a different user / signed out"))
+        except (Auth, Net, ApiError) as e:
+            checks.append(("login_http", False, str(e)))
+    if args.live and left <= 0 and edge is not None:
+        try:
+            with Client(args, st) as cl:
+                d = cl.page_api(_search_page_url("衛生紙", "relevance", 0), "/api/v4/search/search_items",
+                                what="search_items")
+                checks.append(("live_search_page", True, f"total_count={d.get('total_count')}, "
+                                                         f"{len(d.get('items') or [])} items"))
+        except (Net, ApiError, Auth) as e:
+            checks.append(("live_search_page", False, str(e)))
+    data = {k: {"ok": v, "detail": d} for k, v, d in checks}
+    ready = all(v for k, v, _ in checks if k in ("cdp", "edge_signed_in", "cooldown", "live_search_page"))
+    data["ok"] = ready
+
+    def human():
+        lines = [f"shopee doctor (v{VERSION})"]
+        for k, v, d in checks:
+            lines.append(f"  [{'ok  ' if v else 'FAIL'}] {k:<18} {d}")
+        lines.append("ready" if ready else "NOT ready")
+        return "\n".join(lines)
+
+    if args.json:
+        return emit(ok(data) if ready else err("doctor: not ready", EX_NET, checks=data), True)
+    print(human())
+    return EX_OK if ready else EX_NET
+
+
+# ------------------------------------------------------------------ parser
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        as_json = "--json" in sys.argv
+        emit(err(f"{self.prog}: {message}", EX_USAGE), as_json)
+        if not as_json:
+            self.print_usage(sys.stderr)
+        sys.exit(EX_USAGE)
+
+
+def build_parser():
+    p = Parser(prog="shopee", description="Shopee Taiwan (shopee.tw) buyer CLI: search, product, price, cart. No checkout.")
+    p.add_argument("--version", action="version", version=VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="stable {ok, data|error} envelope")
+    common.add_argument("--debug", action="store_true", help="dump requests to stderr")
+    common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
+                        help="transport: browser = signed XHR in a background Edge tab (measured required for "
+                             "/api/v4 search/pdp/cart), http = plain HTTPS, auto (default)")
+    common.add_argument("--cdp", default=None, help=f"CDP endpoint (default {CDP}, env SHOPEE_CDP)")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    dr = sub.add_parser("doctor", parents=[common], help="CDP, Edge sign-in, saved session, cool-down")
+    dr.add_argument("--live", action="store_true", help="also load one search page (one Shopee request)")
+    dr.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("search", parents=[common], help="search products")
+    s.add_argument("query")
+    s.add_argument("--sort", choices=list(SORTS), default="relevance")
+    s.add_argument("--page", type=int, default=1)
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--min", type=float, help="min price TWD (filters the fetched pool)")
+    s.add_argument("--max", type=float, help="max price TWD (filters the fetched pool)")
+    s.add_argument("--fresh", action="store_true", help="ignore the 10-minute result-page cache")
+    s.set_defaults(fn=cmd_search)
+
+    pr = sub.add_parser("product", aliases=["item"], parents=[common], help="one product with variants")
+    pr.add_argument("ref", help="<shopid>.<itemid> or shopee.tw product URL")
+    pr.set_defaults(fn=cmd_product)
+
+    pc = sub.add_parser("price", parents=[common], help="quick price check for several products")
+    pc.add_argument("refs", nargs="+")
+    pc.set_defaults(fn=cmd_price)
+
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in shopee.tw session (never passwords)")
+    g = lg.add_mutually_exclusive_group()
+    g.add_argument("--from-browser", action="store_true", help="(default) copy the session from Edge on CDP")
+    g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
+    g.add_argument("--cookie-stdin", action="store_true", help="Cookie header on stdin")
+    lg.add_argument("--wait", type=int, default=300, help="seconds to wait for you to sign in in Edge")
+    lg.add_argument("--keyring", action="store_true", help="store cookies in the OS keyring")
+    lg.set_defaults(fn=cmd_login)
+    sub.add_parser("logout", parents=[common], help="delete the saved session").set_defaults(fn=cmd_logout)
+    sub.add_parser("whoami", parents=[common], help="verify the saved session").set_defaults(fn=cmd_whoami)
+
+    c = sub.add_parser("cart", parents=[common], help="cart list (read-only; add/qty/rm are disabled, see README)")
+    csub = c.add_subparsers(dest="cart_cmd", required=True, parser_class=Parser)
+    csub.add_parser("list", parents=[common]).set_defaults(fn=cmd_cart_list)
+    ca = csub.add_parser("add", parents=[common])
+    ca.add_argument("ref")
+    ca.add_argument("--qty", type=int, default=1)
+    ca.add_argument("--model", "--spec", "--opt", dest="model", help="modelid, or text matching the variant name")
+    ca.add_argument("--yes", action="store_true", help="(disabled) cart writes are refused")
+    ca.set_defaults(fn=cmd_cart_write)
+    cr = csub.add_parser("rm", parents=[common])
+    cr.add_argument("ref", help="line number from `cart list`, or <shopid>.<itemid>[.<modelid>]")
+    cr.add_argument("--yes", action="store_true")
+    cr.set_defaults(fn=cmd_cart_write)
+    cq = csub.add_parser("qty", parents=[common])
+    cq.add_argument("ref", help="line number from `cart list`, or <shopid>.<itemid>[.<modelid>]")
+    cq.add_argument("qty", type=int)
+    cq.add_argument("--yes", action="store_true")
+    cq.set_defaults(fn=cmd_cart_write)
+
+    r = sub.add_parser("raw", parents=[common], help="GET passthrough (signed) for debugging")
+    r.add_argument("path")
+    r.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if getattr(args, "cdp", None):
+        _set_cdp(args.cdp)
+    try:
+        return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except Usage as e:
+        return emit(err(str(e), EX_USAGE), args.json)
+    except ApiError as e:
+        return emit(err(str(e), EX_ERR, **(e.detail or {})), args.json)
+    except BrokenPipeError:
+        return EX_OK
+    except KeyboardInterrupt:
+        return EX_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
