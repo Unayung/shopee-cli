@@ -53,3 +53,5 @@ and refuses plain HTTPS (`90309999`). Start with `shopee doctor` (it costs at mo
   writes (`90309999`), and UI automation was declined to protect the user's seller account. Tell the user
   to change the cart in Edge themselves, and do not work around it.
 - Never checkout, place an order or pay. The CLI has no such command, by design.
+
+CDP setup: if `shopee doctor` shows `cdp` failing and a command needs Edge, ask the user to start it as in README "Browser on CDP 9222" (separate `--user-data-dir`, `--remote-debugging-port=9222`). Never launch a browser yourself.
